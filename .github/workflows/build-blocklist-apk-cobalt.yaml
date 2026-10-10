@@ -1,0 +1,63 @@
+name: Build Blocklist APK (Cobalt Fork)
+
+on:
+  push:
+    branches: [main, master, blocklist]
+    tags: ['v*', 'blocklist-v*']
+  workflow_dispatch:
+    inputs:
+      cobalt_platform:
+        description: 'Cobalt platform'
+        type: choice
+        options: [android-arm64, android-arm]
+        default: android-arm64
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk
+        run: |
+          docker system prune -af 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h
+
+      - name: Build APK (Docker — android-arm64 gold)
+        run: |
+          PLAT="${{ github.event.inputs.cobalt_platform || 'android-arm64' }}"
+          echo "Building $PLAT ..."
+          # Ensure blocklist dist is present (if mods exists, rebuild)
+          if [[ -d mods ]]; then
+            (cd mods && npm ci && npm run build) || true
+            mkdir -p cobalt/browser/h5vcc_tizentube/dist
+            cp dist/userScript.js cobalt/browser/h5vcc_tizentube/dist/userScript.js 2>/dev/null || true
+          fi
+          docker run --rm -v "$PWD:/workspace" -w /workspace \
+            gcr.io/cobalt-dev/linux \
+            bash -c "python cobalt/build/gn.py -p $PLAT -c gold && autoninja -C out/${PLAT}_gold cobalt/android:cobalt_apk"
+          find out -name "*.apk" -type f | head -n 20
+          APK=$(find out -name "*.apk" -type f | head -1)
+          if [[ -z "$APK" ]]; then echo "APK not found"; exit 1; fi
+          mkdir -p release
+          cp "$APK" release/TizenTubeCobalt-Blocklist.apk
+          ls -lh release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-blocklist
+          path: release/*.apk
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*.apk
+          generate_release_notes: true
