@@ -1,0 +1,150 @@
+name: Build Blocklist APK & WGT
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*', 'blocklist-v*']
+  workflow_dispatch:
+    inputs:
+      build_apk:
+        description: 'Build Android APK (needs Docker, 30GB, ~45min)'
+        type: boolean
+        default: false
+      cobalt_platform:
+        description: 'Cobalt platform'
+        type: choice
+        options: [android-arm64, android-arm]
+        default: android-arm64
+
+permissions:
+  contents: write
+
+jobs:
+  build-mods:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: mods/package-lock.json
+
+      - name: Build dist/userScript.js
+        run: |
+          cd mods
+          npm ci
+          npm run build
+          ls -lh ../dist/userScript.js
+          echo "Built $(du -h ../dist/userScript.js | cut -f1)"
+
+      - name: Upload userScript artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-userScript
+          path: dist/userScript.js
+
+  build-wgt:
+    runs-on: ubuntu-latest
+    needs: build-mods
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build WGT (if tizen available, else just package)
+        run: |
+          cd mods && npm ci && npm run build
+          cd ../standalone/service && npm ci && npm run build || true
+          mkdir -p ../release
+          # Try tizenjs if available, else just keep dist for TizenBrew
+          if command -v tizen >/dev/null 2>&1; then
+            tizen build-web --exclude node_modules || true
+            tizen package -t wgt -o release || true
+          else
+            echo "tizen CLI not on runner — dist/userScript.js is the TizenBrew artifact"
+            npm i -g tizen.js 2>/dev/null || true
+            npx tizenjs build . -t wgt -o release/TizenTubeCobalt-Blocklist.wgt 2>&1 | tail -n 50 || true
+          fi
+          ls -lh standalone/release/ 2>/dev/null || ls -lh dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgt-or-dist
+          path: |
+            dist/userScript.js
+            standalone/release/
+
+  build-apk:
+    if: github.event.inputs.build_apk == 'true' || startsWith(github.ref, 'refs/tags/blocklist-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: build-mods
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: youtube-blocky
+
+      - name: Checkout TizenTubeCobalt
+        uses: actions/checkout@v4
+        with:
+          repository: reisxd/TizenTubeCobalt
+          path: cobalt
+          fetch-depth: 1
+
+      - name: Download built userScript
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-userScript
+          path: /tmp/art
+
+      - name: Patch Cobalt with blocklist
+        run: |
+          set -x
+          SRC=youtube-blocky
+          DST=cobalt
+          # Copy the 6 patched source files if Cobalt vendors them
+          for f in mods/config.js mods/features/adblock.js mods/features/blocklist.js mods/resolveCommand.js mods/ui/settings.js mods/translations/resources/en.json; do
+            if find "$DST" -name "$(basename $f)" | grep -q .; then
+              find "$DST" -name "$(basename "$f)" -exec cp "$SRC/$f" {} \; -print
+            fi
+          done
+          # Always overlay the built dist (most reliable)
+          mkdir -p "$DST/cobalt/browser/h5vcc_tizentube/dist"
+          cp /tmp/art/userScript.js "$DST/cobalt/browser/h5vcc_tizentube/dist/userScript.js"
+          cp "$SRC/dist/userScript.js" "$DST/cobalt/browser/h5vcc_tizentube/dist/userScript.js" 2>/dev/null || true
+          ls -lh "$DST/cobalt/browser/h5vcc_tizentube/dist/"
+
+      - name: Free disk
+        run: |
+          docker system prune -af 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc 2>/dev/null || true
+          df -h
+
+      - name: Build APK (Docker — android-arm64 gold)
+        run: |
+          PLAT="${{ github.event.inputs.cobalt_platform || 'android-arm64' }}"
+          echo "Building $PLAT ..."
+          docker run --rm -v "$PWD/cobalt:/workspace" -w /workspace \
+            gcr.io/cobalt-dev/linux \
+            bash -c "python cobalt/build/gn.py -p $PLAT -c gold && autoninja -C out/${PLAT}_gold cobalt/android:cobalt_apk"
+          find cobalt/out -name "*.apk" -type f | head -n 20
+          APK=$(find cobalt/out -name "*.apk" -type f | head -1)
+          if [[ -z "$APK" ]]; then echo "APK not found"; exit 1; fi
+          mkdir -p youtube-blocky/release
+          cp "$APK" youtube-blocky/release/TizenTubeCobalt-Blocklist.apk
+          ls -lh youtube-blocky/release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-blocklist
+          path: youtube-blocky/release/*.apk
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: youtube-blocky/release/*.apk
+          generate_release_notes: true
